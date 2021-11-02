@@ -12,6 +12,10 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	awsConfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	lambdadetector "go.opentelemetry.io/contrib/detectors/aws/lambda"
+	"go.opentelemetry.io/contrib/propagators/aws/xray"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-lambda-go/otellambda"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-lambda-go/otellambda/xrayconfig"
@@ -45,15 +49,16 @@ func lambda_handler(ctx context.Context) (interface{}, error) {
 	fmt.Println("End Buckets.")
 
 	// HTTP
-	orig := otelhttp.DefaultClient
-	otelhttp.DefaultClient = &http.Client{
+	httpClient := &http.Client{
 		Transport: otelhttp.NewTransport(
 			http.DefaultTransport,
-			otelhttp.WithTracerProvider(otel.GetTracerProvider()),
 		),
 	}
-	defer func() { otelhttp.DefaultClient = orig }()
-	res, err := otelhttp.Get(ctx, "https://api.github.com/repos/open-telemetry/opentelemetry-go/releases/latest")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/open-telemetry/opentelemetry-go/releases/latest", nil)
+	if err != nil {
+		fmt.Printf("failed to create http request, %v\n", err)
+	}
+	res, err := httpClient.Do(req)
 	if err != nil {
 		fmt.Printf("failed to make http request, %v\n", err)
 	}
@@ -78,5 +83,41 @@ func lambda_handler(ctx context.Context) (interface{}, error) {
 }
 
 func main() {
-	lambda.Start(otellambda.InstrumentHandler(lambda_handler, xrayconfig.AllRecommendedOptions()...))
+	ctx := context.Background()
+
+	tp, err := initTracerProvider(ctx)
+	if err != nil {
+		fmt.Printf("error creating tracer provider: %v", err)
+	}
+	defer func(ctx context.Context) {
+		err := tp.Shutdown(ctx)
+		if err != nil {
+			fmt.Printf("error shutting down tracer provider: %v", err)
+		}
+	}(ctx)
+
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(xray.Propagator{})
+
+	lambda.Start(otellambda.InstrumentHandler(lambda_handler, xrayconfig.EventToCarrier(), otellambda.WithFlusher(tp)))
+}
+
+func initTracerProvider(ctx context.Context) (*sdktrace.TracerProvider, error) {
+	fmt.Println("creating trace exporter")
+	exp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithInsecure())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create exporter: %w", err)
+	}
+
+	detector := lambdadetector.NewResourceDetector()
+	resource, err := detector.Detect(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to detect lambda resources: %w", err)
+	}
+
+	return sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+		sdktrace.WithIDGenerator(xray.NewIDGenerator()),
+		sdktrace.WithResource(resource),
+	), nil
 }
