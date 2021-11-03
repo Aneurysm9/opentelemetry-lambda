@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
@@ -85,6 +86,20 @@ func lambda_handler(ctx context.Context) func(ctx context.Context) (interface{},
 	}
 }
 
+type asyncSafeFlusher struct {
+	tp *sdktrace.TracerProvider
+}
+
+func (f asyncSafeFlusher) ForceFlush(ctx context.Context) error {
+	// yield processor to attempt to ensure all spans have
+	// been consumed and are ready to be flushed
+	// - see https://github.com/open-telemetry/opentelemetry-go/issues/2080
+	// to be removed upon resolution of above issue
+	runtime.Gosched()
+
+	return f.tp.ForceFlush(ctx)
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -102,7 +117,7 @@ func main() {
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(xray.Propagator{})
 
-	lambda.Start(otellambda.InstrumentHandler(lambda_handler(ctx), xrayconfig.EventToCarrier(), otellambda.WithFlusher(tp)))
+	lambda.Start(otellambda.InstrumentHandler(lambda_handler(ctx), xrayconfig.EventToCarrier(), otellambda.WithFlusher(asyncSafeFlusher{tp})))
 }
 
 func initTracerProvider(ctx context.Context) (*sdktrace.TracerProvider, error) {
